@@ -124,9 +124,9 @@
   patterns:
     << : *common_patterns
 
-
-version:
-    name: '1.9.0'
+-
+  version:
+      name: '1.9.0'
 
   precisions:
     names: int8, fp32
@@ -169,7 +169,7 @@ version:
         '_sg_mkldnn_selfatt_qk': {
             'activation': {
                 'dtype': ['int8', 'fp32'],
-                'algorithm': ['minmax', 'kl']}
+                'algorithm': ['kl']}
         },
         '_sg_mkldnn_selfatt_valatt': {
             'activation': {

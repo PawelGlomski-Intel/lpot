@@ -78,7 +78,7 @@ class MxNetAdaptor(Adaptor):
         if not _check_version(mx.__version__, '1.6.0'):
             raise Exception("Need MXNet version >= 1.6.0, but get version: %s" % (mx.__version__))
 
-    def _get_backedn_graph(self, symbol, ctx):
+    def _fuse(self, symbol, ctx=mx.cpu()):
         if ctx == mx.cpu():
             return symbol.get_backend_symbol('MKLDNN_QUANTIZE')
         else:
@@ -99,7 +99,7 @@ class MxNetAdaptor(Adaptor):
         Returns:
             (dict): quantized model
         """
-        assert q_func is None, "quantization aware training mode is not support on mxnet"
+        assert q_func is None, "quantization aware training mode is not supported on mxnet"
 
         # get symbol from FP32 model
         if isinstance(model.model, mx.gluon.HybridBlock):
@@ -115,11 +115,11 @@ class MxNetAdaptor(Adaptor):
             raise ValueError(
                 'Need a symbol model or HybridBlock model, while received %s' % str(
                     type(model.model)))
-
-        self._cfg_to_qconfig(tune_cfg)
+        
+        sym = self._fuse(sym)
+        self._cfg_to_qconfig(sym, tune_cfg)
         self.th_dict = None
         qconfig = self.__config_dict
-        sym = self._get_backedn_graph(sym, qconfig['ctx'])
 
         # 1. quantize_symbol
         if _check_version(mx.__version__, '1.7.0'):
@@ -149,7 +149,8 @@ class MxNetAdaptor(Adaptor):
         # 4. quantize params
         qarg_params = mx.contrib.quantization._quantize_params(
             qsym, arg_params, th_dict)
-        qsym = self._get_backedn_graph(qsym, qconfig['ctx'])
+        # 5. post-quantization fusion
+        qsym = self._fuse(qsym)
 
         if isinstance(model.model, mx.gluon.HybridBlock):
             from mxnet.gluon import SymbolBlock
@@ -180,8 +181,8 @@ class MxNetAdaptor(Adaptor):
         """
         raise NotImplementedError
 
-    def evaluate(self, model, dataloader, postprocess=None, \
-                 metric=None, measurer=None, iteration=-1, \
+    def evaluate(self, model, dataloader, postprocess=None,
+                 metric=None, measurer=None, iteration=-1,
                  tensorboard=False, fp32_baseline=False):
         """The function is used to run evaluation on validation dataset.
 
@@ -199,22 +200,20 @@ class MxNetAdaptor(Adaptor):
             acc: evaluate result.
         """
         if isinstance(model.model, mx.gluon.HybridBlock):
-            acc = self._mxnet_gluon_forward(model.model, dataloader, postprocess, \
+            acc = self._mxnet_gluon_forward(model.model, dataloader, postprocess,
                                             metric, measurer, iteration)
-
         elif isinstance(model.model[0], mx.symbol.symbol.Symbol):
             assert isinstance(dataloader, mx.io.DataIter), \
                 'need mx.io.DataIter. but recived %s' % str(type(dataloader))
             dataloader.reset()
-            acc = self._mxnet_symbol_forward(model.model, dataloader, postprocess, \
+            acc = self._mxnet_symbol_forward(model.model, dataloader, postprocess,
                                              metric, measurer, iteration)
-
         else:
-            raise ValueError("Unknow graph tyep: %s" % (str(type(model))))
+            raise ValueError("Unknown graph type: %s" % (str(type(model))))
 
         return acc
 
-    def _mxnet_symbol_forward(self, symbol_file, dataIter, \
+    def _mxnet_symbol_forward(self, symbol_file, dataIter,
                               postprocess, metric, measurer, iteration):
         """MXNet symbol model evaluation process.
         Args:
@@ -226,7 +225,7 @@ class MxNetAdaptor(Adaptor):
             acc: evaluate result
         """
         sym, arg_params, aux_params = symbol_file
-        sym = sym.get_backend_symbol('MKLDNN_QUANTIZE')
+        sym = self._fuse(sym)
         data_name = (dataIter.provide_data[0].name,)
         label_name = (dataIter.provide_label[0].name,)
         mod = mx.mod.Module(symbol=sym, context=mx.cpu(),
@@ -285,8 +284,7 @@ class MxNetAdaptor(Adaptor):
         Returns:
             tuple: Symbol model include sym, arg_params, aux_params.
         """
-        from lpot.model.model import MXNetModel
-        if isinstance(model, MXNetModel):
+        if isinstance(model, Model):
             model = model.model
         if isinstance(model, mx.gluon.HybridBlock):
             # model.hybridblock()
@@ -317,34 +315,19 @@ class MxNetAdaptor(Adaptor):
 
         sym, arg_params, aux_params, calib_data = self._check_model(
             model, calib_data)
-        sym = sym.get_backend_symbol('MKLDNN_QUANTIZE')
+        sym = self._fuse(sym)
 
-        _, calib_layer = mx.contrib.quantization._quantize_symbol(
+        qsym, _ = mx.contrib.quantization._quantize_symbol(
             sym,
             mx.cpu(),
             offline_params=list(arg_params.keys()),
         )
-
-        # get each op type
-        dct = json.loads(sym.tojson())
-        op_type = []
-        for item in dct['nodes']:
-            op_type.append(item['op'])
-
-        symbol_layers = []
-        sym_all_layers = [layer.name for layer in list(sym.get_internals())]
-        name_type = zip(sym_all_layers, op_type)
-
-        arg_params_list = list(arg_params.keys())
-        aux_params_list = list(aux_params.keys())
-        for name, type in name_type:
-            if name not in arg_params_list and item not in aux_params_list:
-                symbol_layers.append({"name": name, "type": type})
-
-        for _, opname_type in enumerate(symbol_layers):
-            if opname_type["name"] + "_output" in calib_layer:
-                self.quantizable_ops.append(opname_type)
-
+        
+        dct = json.loads(qsym.tojson())
+        q_prefix = 'quantized_'
+        for node in dct['nodes']:
+            if node['name'].startswith(q_prefix):
+                self.quantizable_ops.append({'name': node['name'][len(q_prefix):], 'type': node['op']})
         return self.quantizable_ops
 
     def query_fused_patterns(self, model):
@@ -369,7 +352,6 @@ class MxNetAdaptor(Adaptor):
         op_type_wise = OrderedDict()
         op_wise = OrderedDict()
         quantizable_op_config = self.query_handler.get_quantization_capability()['int8']
-        mixed_quantization = self.query_handler.get_mixed_precision_combination()
         # (TODO) to allign with other fw, set pre_optimized_model here
         self.pre_optimized_model = model
         for _, opname_type in enumerate(quantizable_ops):
@@ -540,10 +522,11 @@ class MxNetAdaptor(Adaptor):
         """
         raise NotImplementedError
 
-    def _cfg_to_qconfig(self, tune_cfg):
+    def _cfg_to_qconfig(self, sym, tune_cfg):
         """Convert the strategy config to MXNet quantization config.
 
         Args:
+            sym (object): model symbol
             tune_cfg (dict): tune config from lpot strategy.
                             cfg should be a format like below:
                             {
@@ -579,26 +562,33 @@ class MxNetAdaptor(Adaptor):
         excluded_op_names = []
         calib_minmax_layers = []
         calib_kl_layers = []
-
-        for _, op in enumerate(self.quantizable_ops):
-            # get qdata type per op
-            if tune_cfg['op'][(op["name"], op["type"])
-                              ]['activation']['dtype'] == 'fp32':
+        minmax_op_out = []
+        kl_op_out = []
+        name_to_sym = {s.name:s for s in sym.get_internals()}
+        for op in self.quantizable_ops:
+            cfg = tune_cfg['op'][(op["name"], op["type"])]['activation']
+            calib_list = calib_kl_layers if cfg['algorithm'] == 'kl' else calib_minmax_layers
+            op_out = kl_op_out if cfg['algorithm'] == 'kl' else minmax_op_out
+            if cfg['dtype'] in ['fp32', 'bf16']:
                 excluded_sym_names.append(op["name"])
-                continue
-            # get calib algorithm per op
-            if tune_cfg['op'][(op["name"], op["type"])
-                              ]['activation']['algorithm'] == 'minmax':
-                calib_minmax_layers.append(op["name"] + "_output")
-            elif tune_cfg['op'][(op["name"], op["type"])]['activation']['algorithm'] == 'kl':
-                calib_kl_layers.append(op["name"] + "_output")
+            else:
+                s = name_to_sym[op['name']]
+                for out in s.list_outputs():
+                    op_out.append(out)
+                for in_sym in s.get_children():
+                    for out in in_sym.list_outputs():
+                        calib_list.append(out)
 
-        LayerOutputCollector = None
+        calib_minmax_layers = set(calib_minmax_layers)
+        calib_kl_layers = set(calib_kl_layers)
+        input_calib_layers = calib_minmax_layers | calib_kl_layers
+        calib_minmax_layers |= set(minmax_op_out) - input_calib_layers
+        calib_kl_layers |= set(kl_op_out) - input_calib_layers
+
         # for not tunable config
         quantized_dtype = 'auto'
         quantize_mode = 'smart'
         quantize_granularity = 'tensor-wise'
-        logger = self.logger
         ctx = mx.cpu()
         batch_size = self.__config_dict['calib_data'].batch_size
         iteration = tune_cfg['calib_iteration']
@@ -607,15 +597,12 @@ class MxNetAdaptor(Adaptor):
         self.__config_dict.update({
             "excluded_sym_names": excluded_sym_names,
             "excluded_op_names": excluded_op_names,
-            "LayerOutputCollector": LayerOutputCollector,
             "quantized_dtype": quantized_dtype,
             "quantize_mode": quantize_mode,
             "quantize_granularity": quantize_granularity,
-            "logger": logger,
             "ctx": ctx,
             "num_calib_examples": num_calib_examples,
             "iteration": iteration,
-            "exclude_layers_match": [],
             "calib_kl_layers": calib_kl_layers,
             "calib_minmax_layers": calib_minmax_layers,
         })
@@ -797,8 +784,6 @@ class MxNetAdaptor(Adaptor):
                              ' while received type %s' % (str(type(calib_data))))
 
         data_names = [pair[0] for pair in calib_data.provide_data]
-        # label_names = [pair[0] for pair in calib_data.provide_label]
-
         mod = mx.module.module.Module(
             symbol=sym, data_names=data_names, context=ctx)
         if hasattr(calib_data,
@@ -810,20 +795,20 @@ class MxNetAdaptor(Adaptor):
             mod.bind(for_training=False, data_shapes=calib_data.provide_data)
         mod.set_params(arg_params, aux_params)
 
-        for data_name in data_names:
-            # the data_name of gluon model may diff with the name of input data layer,
-            # it caused by gluon model convert to symbol model
-            if data_name in calib_layer:
-                self.__config_dict["calib_minmax_layers"].append(data_name)
+        calib_layer = set(calib_layer)
+        calib_kl_layers = self.__config_dict["calib_kl_layers"] & calib_layer
+        calib_minmax_layers = (self.__config_dict["calib_minmax_layers"] & calib_layer)
+        calib_minmax_layers -= calib_kl_layers # prioritize kl
+        assert calib_layer == (calib_kl_layers | calib_minmax_layers)
 
-        if len(self.__config_dict["calib_kl_layers"]) != 0:
+        if len(calib_kl_layers) != 0:
             # inspect each quantized layer activate tensor for calibration
             layer_tensor = self._inspect_tensor((sym, arg_params, aux_params),
                                                 dataloader=calib_data,
                                                 op_list=calib_layer)
             _histogram = LayerHistogramCollector(
                 layer_tensor=layer_tensor,
-                include_layer=self.__config_dict["calib_kl_layers"])
+                include_layer=calib_kl_layers)
             _histogram.collect()
             hist_dict = _histogram.hist_dict
             self.logger.info('Calculating optimal thresholds for quantization')
@@ -833,10 +818,10 @@ class MxNetAdaptor(Adaptor):
             self._merge_dicts(th_dict_kl, th_dict)
 
         calib_data.reset()
-        if len(self.__config_dict["calib_minmax_layers"]) != 0:
+        if len(calib_minmax_layers) != 0:
             th_dict_minmax = self._get_min_max_thresholds(
                 mod, calib_data, quantized_dtype,
-                include_layer=self.__config_dict["calib_minmax_layers"],
+                include_layer=calib_minmax_layers,
                 max_num_examples=num_calib_examples,
                 logger=logger)
             self._merge_dicts(th_dict_minmax, th_dict)
