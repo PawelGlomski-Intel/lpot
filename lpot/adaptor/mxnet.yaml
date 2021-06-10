@@ -169,7 +169,7 @@
         '_sg_mkldnn_selfatt_qk': {
             'activation': {
                 'dtype': ['int8', 'fp32'],
-                'algorithm': ['kl']}
+                'algorithm': ['minmax', 'kl']}
         },
         '_sg_mkldnn_selfatt_valatt': {
             'activation': {

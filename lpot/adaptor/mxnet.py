@@ -26,8 +26,6 @@ import yaml
 from .adaptor import adaptor_registry, Adaptor
 from .query import QueryBackendCapability
 from ..utils.utility import LazyImport, singleton
-from ..utils.kl_divergence import KL_Divergence
-from ..utils.collect_layer_histogram import LayerHistogramCollector
 from collections import OrderedDict
 from lpot.utils.utility import dump_elapsed_time
 from lpot.model.model import MXNetModel as Model
@@ -584,7 +582,7 @@ class MxNetAdaptor(Adaptor):
         input_calib_layers = calib_minmax_layers | calib_kl_layers
         calib_minmax_layers |= set(minmax_op_out) - input_calib_layers
         calib_kl_layers |= set(kl_op_out) - input_calib_layers
-
+        
         # for not tunable config
         quantized_dtype = 'auto'
         quantize_mode = 'smart'
@@ -690,59 +688,6 @@ class MxNetAdaptor(Adaptor):
 
         return symnet, args, auxs, calib_data
 
-    @dump_elapsed_time("Compute quantization scaling using KL algorithm")
-    def _get_optimal_thresholds(self, hist_dict, quantized_dtype,
-                                num_quantized_bins=255, logger=None):
-        """Given a ndarray dict, find the optimal threshold for quantizing each value of the key.
-
-        Args:
-            hist_dict (dict): dict of each layer output tensor, format as {layer_name: tensor}.
-            quantized_dtype (str): quantized data type.
-            num_quantized_bins (int, optional): num_quantized_bins. Defaults to 255.
-            logger (logger, optional): logger. Defaults to None.
-
-        Returns:
-            th_dict (dict): optimal_thresholds of each layer tensor.
-        """
-        assert isinstance(hist_dict, dict)
-        self.logger.info(
-            'Calculating optimal thresholds for quantization using KL divergence'
-            ' with num_quantized_bins=%d' % num_quantized_bins)
-        th_dict = {}
-        # copy hist_dict keys since the keys() only returns a view in python3
-        layer_names = list(hist_dict.keys())
-        _kl = KL_Divergence()
-        for name in layer_names:
-            assert name in hist_dict
-            (hist, hist_edges, min_val, max_val, _) = hist_dict[name]
-            th = _kl.get_threshold(hist,
-                                   hist_edges,
-                                   min_val,
-                                   max_val,
-                                   num_bins=8001,
-                                   quantized_type=quantized_dtype,
-                                   num_quantized_bins=255)
-
-            if min_val >= 0 and quantized_dtype in ['auto', 'uint8']:
-                th_dict[name] = (0, th)
-            else:
-                th_dict[name] = (-th, th)
-            del hist_dict[name]  # release the memory
-            self.logger.debug('layer=%s, min_val=%f, max_val=%f, th=%f, '
-                              % (name, min_val, max_val, th))
-        return th_dict
-
-    @dump_elapsed_time("Compute quantization scaling using minmax algorithm")
-    def _get_min_max_thresholds(self, mod, calib_data, quantized_dtype,
-                                include_layer, max_num_examples, logger):
-        th_dict_min_max, num_examples = mx.contrib.quantization._collect_layer_output_min_max(
-            mod, calib_data, quantized_dtype, include_layer=include_layer,
-            max_num_examples=max_num_examples, logger=logger)
-
-        logger.info('Collected layer output min/max values from FP32 model using %d examples' %
-                    num_examples)
-        return th_dict_min_max
-
     def _get_calibration_th(
             self,
             sym,
@@ -763,14 +708,72 @@ class MxNetAdaptor(Adaptor):
         Returns:
             th_dict (dict): dict include the calibration value of each layer.
         """
+        from mxnet.base import py_str, ctypes, NDArrayHandle
+        from mxnet.ndarray import NDArray
+
+        class _LayerCollector(object):
+            """Saves layer histogram in a dict with layer names as keys and lists of NDArrays as
+            values. The collected histogram will be used for calculating the optimal thresholds for
+            quantization using KL divergence.
+            """
+
+            def __init__(self, num_bins=8001, include_layer_kl=None, include_layer_minmax=None, logger=None, ctx=mx.cpu()):
+                self.min_max_dict = {}
+                self.hist_dict = {}
+                self.num_bins = num_bins
+                self.include_layer_minmax = include_layer_minmax
+                self.include_layer_kl = include_layer_kl
+                self.logger = logger
+                self.ctx = ctx
+
+            def collect(self, name, arr):
+                """Callback function for collecting layer output NDArrays."""
+                name = py_str(name)
+                if name in self.include_layer_kl:
+                    alg = 'kl'
+                elif name in self.include_layer_minmax:
+                    alg = 'minmax'
+                else:
+                    return
+
+                handle = ctypes.cast(arr, NDArrayHandle)
+                arr = NDArray(handle, writable=False)
+                min_range = mx.ndarray.min(arr).asscalar()
+                max_range = mx.ndarray.max(arr).asscalar()
+                th = max(abs(min_range), abs(max_range))
+                # minmax (always)
+                if self.logger:
+                    self.logger.debug("Collecting layer %s min_range=%f, max_range=%f"
+                                        % (name, min_range, max_range))
+                if name in self.min_max_dict:
+                    cur_min_max = self.min_max_dict[name]
+                    self.min_max_dict[name] = (min(cur_min_max[0], min_range),
+                                                max(cur_min_max[1], max_range))
+                else:
+                    self.min_max_dict[name] = (min_range, max_range)
+
+                if alg == 'kl': # histogram only when kl is specified
+                    arr = arr.asnumpy()
+                    if self.logger:
+                        self.logger.debug("Collecting layer %s histogram of shape %s" %
+                                          (name, arr.shape))
+                    if name in self.hist_dict:
+                        self.hist_dict[name] = mx.contrib.quantization.combine_histogram(
+                            self.hist_dict[name], arr, min_range, max_range, th)
+                    else:
+                        hist, hist_edges = np.histogram(arr, bins=self.num_bins, range=(-th, th))
+                        self.hist_dict[name] = (hist, hist_edges, min_range, max_range, th)
+
         ctx = qconfig['ctx']
         calib_data = qconfig['calib_data']
         num_calib_examples = qconfig['num_calib_examples']
         quantized_dtype = qconfig['quantized_dtype']
-        logger = self.logger
 
-        calib_data.reset()
         th_dict = {}
+        if not hasattr(self, 'th_dict_kl'):
+            self.th_dict_kl = {}
+        if not hasattr(self, 'th_dict_minmax'):
+            self.th_dict_minmax = {}
 
         if not isinstance(ctx, mx.context.Context):
             raise ValueError(
@@ -786,9 +789,7 @@ class MxNetAdaptor(Adaptor):
         data_names = [pair[0] for pair in calib_data.provide_data]
         mod = mx.module.module.Module(
             symbol=sym, data_names=data_names, context=ctx)
-        if hasattr(calib_data,
-                   'provide_label') and len(
-                       calib_data.provide_label) > 0:
+        if hasattr(calib_data, 'provide_label') and len(calib_data.provide_label) > 0:
             mod.bind(for_training=False, data_shapes=calib_data.provide_data,
                      label_shapes=calib_data.provide_label)
         else:
@@ -801,30 +802,26 @@ class MxNetAdaptor(Adaptor):
         calib_minmax_layers -= calib_kl_layers # prioritize kl
         assert calib_layer == (calib_kl_layers | calib_minmax_layers)
 
-        if len(calib_kl_layers) != 0:
-            # inspect each quantized layer activate tensor for calibration
-            layer_tensor = self._inspect_tensor((sym, arg_params, aux_params),
-                                                dataloader=calib_data,
-                                                op_list=calib_layer)
-            _histogram = LayerHistogramCollector(
-                layer_tensor=layer_tensor,
-                include_layer=calib_kl_layers)
-            _histogram.collect()
-            hist_dict = _histogram.hist_dict
-            self.logger.info('Calculating optimal thresholds for quantization')
-
-            th_dict_kl = self._get_optimal_thresholds(
-                hist_dict, quantized_dtype, logger=logger)
-            self._merge_dicts(th_dict_kl, th_dict)
+        to_collect_kl = calib_kl_layers-set(self.th_dict_kl.keys())
+        to_collect_minmax = calib_minmax_layers-set(self.th_dict_minmax.keys())
 
         calib_data.reset()
-        if len(calib_minmax_layers) != 0:
-            th_dict_minmax = self._get_min_max_thresholds(
-                mod, calib_data, quantized_dtype,
-                include_layer=calib_minmax_layers,
-                max_num_examples=num_calib_examples,
-                logger=logger)
-            self._merge_dicts(th_dict_minmax, th_dict)
+        collector = _LayerCollector(include_layer_kl=to_collect_kl,
+                                    include_layer_minmax=to_collect_minmax, logger=logger)
+        if len(to_collect_kl) + len(to_collect_minmax) > 0:
+            self.logger.info("Collecting the output values of the FP32 model layers")
+            num_examples = mx.contrib.quantization._collect_layer_statistics(
+                mod, calib_data, collector, num_calib_examples, self.logger)
+            self.logger.info(
+                'Collected the output values of the FP32 model layers from %d examples' % num_examples)
+            if len(to_collect_kl) > 0:
+                self.th_dict_kl.update(mx.contrib.quantization._get_optimal_thresholds(
+                    collector.hist_dict, quantized_dtype, logger=self.logger))
+            self.th_dict_minmax.update(collector.min_max_dict)
+
+        self._merge_dicts({layer: self.th_dict_minmax[layer]
+                          for layer in calib_minmax_layers}, th_dict)
+        self._merge_dicts({layer: self.th_dict_kl[layer] for layer in calib_kl_layers}, th_dict)
 
         return th_dict
 
