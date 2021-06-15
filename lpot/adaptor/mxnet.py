@@ -115,7 +115,7 @@ class MxNetAdaptor(Adaptor):
                     type(model.model)))
         
         sym = self._fuse(sym)
-        self._cfg_to_qconfig(sym, tune_cfg)
+        self._cfg_to_qconfig(tune_cfg)
         self.th_dict = None
         qconfig = self.__config_dict
 
@@ -311,21 +311,60 @@ class MxNetAdaptor(Adaptor):
         if len(self.quantizable_ops) != 0:
             return self.quantizable_ops
 
-        sym, arg_params, aux_params, calib_data = self._check_model(
-            model, calib_data)
+        sym, arg_params, aux_params, calib_data = self._check_model(model, calib_data)
         sym = self._fuse(sym)
+        symbols_named = {s.name: s for s in sym.get_internals()}
+        nodes_ops = {n['name']: n['op'] for n in json.loads(sym.tojson())['nodes']}
 
-        qsym, _ = mx.contrib.quantization._quantize_symbol(
-            sym,
-            mx.cpu(),
-            offline_params=list(arg_params.keys()),
-        )
-        
-        dct = json.loads(qsym.tojson())
-        q_prefix = 'quantized_'
-        for node in dct['nodes']:
-            if node['name'].startswith(q_prefix):
-                self.quantizable_ops.append({'name': node['name'][len(q_prefix):], 'type': node['op']})
+        qsym, true_calib_layer = mx.contrib.quantization._quantize_symbol(
+            sym, mx.cpu(), offline_params=list(arg_params.keys()))
+        qnodes_ops = {n['name']: n['op'] for n in json.loads(qsym.tojson())['nodes']}
+
+        MXNET_ERR_MSG = 'Unsupported version of MXNet - '
+        QUANTIZED_PREFIX = 'quantized_'
+        QUANTIZE_OP_NAMES = ['_contrib_quantize_v2']
+
+        # Getting quantizable nodes:
+        # 1. Get nodes that has been quantized
+        # 2. Get nodes whose outputs has been quantized (by 'quantize' nodes) - these are
+        #    inputs of the nodes that has been quantized
+        quantizable = {}
+        for qnode_sym in qsym.get_internals():
+            is_q = qnode_sym.attr('quantized')
+            if is_q is not None and is_q == 'True':
+                if qnode_sym.name.startswith(QUANTIZED_PREFIX):
+                    node_name = qnode_sym.name[len(QUANTIZED_PREFIX):]
+                else:
+                    node_name = qnode_sym.name
+                assert node_name in nodes_ops.keys(), MXNET_ERR_MSG + \
+                    'name of the quantized node must be unchanged or in the following format: ' \
+                    '({}_<fp32_node_name>). Node: {}'.format(QUANTIZED_PREFIX, node_name)
+
+                quantizable[node_name] = {'op': nodes_ops[node_name],
+                                          'outs': symbols_named[node_name].list_outputs()}
+
+                for in_sym in qnode_sym.get_children():
+                    if qnodes_ops[in_sym.name] in QUANTIZE_OP_NAMES:
+                        assert len(in_sym.get_children()) == 1, MXNET_ERR_MSG + \
+                            '`quantize` node must have only one input'
+                        quantize_sym = in_sym.get_children()[0]
+
+                        assert quantize_sym.name in nodes_ops.keys(), MXNET_ERR_MSG + \
+                            'the name of the `quantize` input node must be the same' \
+                            'as the name of the corresponding node in fp32 model'
+                        quantizable[quantize_sym.name] = {'op': 'quantize_output',
+                                                          'outs': quantize_sym.list_outputs()}
+
+        calib_layer = []
+        for n in quantizable.values():
+            calib_layer += n['outs']
+        calib_layer = set(calib_layer)
+        true_calib_layer = set(true_calib_layer)
+        assert true_calib_layer.issubset(calib_layer), 'Unexpected nodes for calibration - ' \
+            'please report this issue. Nodes: {}'.format(true_calib_layer - calib_layer)
+
+        self.quantizable_ops = [{'name': name, 'type': d['op'], 'outs':d['outs']}
+                                for (name, d) in quantizable.items()]
         return self.quantizable_ops
 
     def query_fused_patterns(self, model):
@@ -520,11 +559,10 @@ class MxNetAdaptor(Adaptor):
         """
         raise NotImplementedError
 
-    def _cfg_to_qconfig(self, sym, tune_cfg):
+    def _cfg_to_qconfig(self, tune_cfg):
         """Convert the strategy config to MXNet quantization config.
 
         Args:
-            sym (object): model symbol
             tune_cfg (dict): tune config from lpot strategy.
                             cfg should be a format like below:
                             {
@@ -560,29 +598,18 @@ class MxNetAdaptor(Adaptor):
         excluded_op_names = []
         calib_minmax_layers = []
         calib_kl_layers = []
-        minmax_op_out = []
-        kl_op_out = []
-        name_to_sym = {s.name:s for s in sym.get_internals()}
         for op in self.quantizable_ops:
             cfg = tune_cfg['op'][(op["name"], op["type"])]['activation']
             calib_list = calib_kl_layers if cfg['algorithm'] == 'kl' else calib_minmax_layers
-            op_out = kl_op_out if cfg['algorithm'] == 'kl' else minmax_op_out
             if cfg['dtype'] in ['fp32', 'bf16']:
                 excluded_sym_names.append(op["name"])
-            else:
-                s = name_to_sym[op['name']]
-                for out in s.list_outputs():
-                    op_out.append(out)
-                for in_sym in s.get_children():
-                    for out in in_sym.list_outputs():
-                        calib_list.append(out)
+            calib_list += op['outs']
 
         calib_minmax_layers = set(calib_minmax_layers)
         calib_kl_layers = set(calib_kl_layers)
-        input_calib_layers = calib_minmax_layers | calib_kl_layers
-        calib_minmax_layers |= set(minmax_op_out) - input_calib_layers
-        calib_kl_layers |= set(kl_op_out) - input_calib_layers
-        
+        assert len(calib_kl_layers & calib_minmax_layers) == 0, \
+            'Repetition in `self.quantizable_ops` or different nodes have the same output names'
+
         # for not tunable config
         quantized_dtype = 'auto'
         quantize_mode = 'smart'
@@ -717,7 +744,8 @@ class MxNetAdaptor(Adaptor):
             quantization using KL divergence.
             """
 
-            def __init__(self, num_bins=8001, include_layer_kl=None, include_layer_minmax=None, logger=None, ctx=mx.cpu()):
+            def __init__(self, num_bins=8001, include_layer_kl=None, include_layer_minmax=None,
+                         logger=None, ctx=mx.cpu()):
                 self.min_max_dict = {}
                 self.hist_dict = {}
                 self.num_bins = num_bins
@@ -744,11 +772,11 @@ class MxNetAdaptor(Adaptor):
                 # minmax (always)
                 if self.logger:
                     self.logger.debug("Collecting layer %s min_range=%f, max_range=%f"
-                                        % (name, min_range, max_range))
+                                      % (name, min_range, max_range))
                 if name in self.min_max_dict:
                     cur_min_max = self.min_max_dict[name]
                     self.min_max_dict[name] = (min(cur_min_max[0], min_range),
-                                                max(cur_min_max[1], max_range))
+                                               max(cur_min_max[1], max_range))
                 else:
                     self.min_max_dict[name] = (min_range, max_range)
 
@@ -797,23 +825,24 @@ class MxNetAdaptor(Adaptor):
         mod.set_params(arg_params, aux_params)
 
         calib_layer = set(calib_layer)
-        calib_kl_layers = self.__config_dict["calib_kl_layers"] & calib_layer
-        calib_minmax_layers = (self.__config_dict["calib_minmax_layers"] & calib_layer)
-        calib_minmax_layers -= calib_kl_layers # prioritize kl
-        assert calib_layer == (calib_kl_layers | calib_minmax_layers)
+        calib_kl_layers = (self.__config_dict['calib_kl_layers'] & calib_layer)
+        calib_minmax_layers = (self.__config_dict['calib_minmax_layers'] & calib_layer)
+        assert calib_layer == (calib_kl_layers | calib_minmax_layers), \
+            'Unexpected nodes for calibration. Nodes: {}'.format(
+                calib_layer - (calib_kl_layers | calib_minmax_layers))
 
         to_collect_kl = calib_kl_layers-set(self.th_dict_kl.keys())
         to_collect_minmax = calib_minmax_layers-set(self.th_dict_minmax.keys())
 
         calib_data.reset()
         collector = _LayerCollector(include_layer_kl=to_collect_kl,
-                                    include_layer_minmax=to_collect_minmax, logger=logger)
+                                    include_layer_minmax=to_collect_minmax, logger=self.logger)
         if len(to_collect_kl) + len(to_collect_minmax) > 0:
-            self.logger.info("Collecting the output values of the FP32 model layers")
+            self.logger.info('Collecting the output values of the FP32 model layers')
             num_examples = mx.contrib.quantization._collect_layer_statistics(
                 mod, calib_data, collector, num_calib_examples, self.logger)
-            self.logger.info(
-                'Collected the output values of the FP32 model layers from %d examples' % num_examples)
+            self.logger.info('Collected the output values of the FP32 model layers '
+                             'from %d examples' % num_examples)
             if len(to_collect_kl) > 0:
                 self.th_dict_kl.update(mx.contrib.quantization._get_optimal_thresholds(
                     collector.hist_dict, quantized_dtype, logger=self.logger))
