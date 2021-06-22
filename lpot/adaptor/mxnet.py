@@ -831,8 +831,8 @@ class MxNetAdaptor(Adaptor):
             'Unexpected nodes for calibration. Nodes: {}'.format(
                 calib_layer - (calib_kl_layers | calib_minmax_layers))
 
-        to_collect_kl = calib_kl_layers-set(self.th_dict_kl.keys())
-        to_collect_minmax = calib_minmax_layers-set(self.th_dict_minmax.keys())
+        to_collect_kl = calib_kl_layers - set(self.th_dict_kl.keys())
+        to_collect_minmax = calib_minmax_layers - set(self.th_dict_minmax.keys())
 
         calib_data.reset()
         collector = _LayerCollector(include_layer_kl=to_collect_kl,

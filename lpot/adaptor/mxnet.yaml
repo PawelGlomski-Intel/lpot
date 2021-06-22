@@ -17,13 +17,19 @@
 -
   version:
     name: 'default'
+    # (MXNet-specific): 
+    # 'int8' for this version specifies quantization in general (both int8 and uint8), as 
+    # quantization dtype is selected automatically for each quantized node according to the
+    # calibration results: min_value < 0 => int8; min_value >= 0 => uint8.
+    # 'int8' here == 'auto' in MXNet
 
   precisions: &common_precisions
     names: int8, fp32
     valid_mixed_precisions: []
 
   ops: &common_ops
-    fp32: &fp32_ops ['_sg_mkldnn_conv', 'Convolution', 
+    fp32: &fp32_ops [
+            '_sg_mkldnn_conv', 'Convolution', 
             '_sg_mkldnn_fully_connected', 'FullyConnected', 
             '_sg_mkldnn_selfatt_qk', '_sg_mkldnn_selfatt_valatt']
     int8:  ['quantize_output', *fp32_ops]
@@ -34,7 +40,7 @@
             'activation': {
                 'dtype': ['int8'],
                 'algorithm': ['minmax', 'kl']},
-        },      
+        }, 
         '_sg_mkldnn_conv': {
             'activation': {
                 'dtype': ['int8', 'fp32'],
@@ -72,7 +78,7 @@
             'activation': {
                 'dtype': ['int8', 'fp32'],
                 'algorithm': ['minmax', 'kl']}
-        },
+        },     
         'default': {
             'activation': {
                 'dtype': ['int8', 'fp32'],
@@ -83,6 +89,8 @@
       }
 
   patterns: &common_patterns
+  # (MXNet-specific):
+  # fusion patterns are hardcoded in the framework 
     fp32: []
     int8: []
 
