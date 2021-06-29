@@ -31,7 +31,8 @@
     fp32: &fp32_ops [
             '_sg_mkldnn_conv', 'Convolution', 
             '_sg_mkldnn_fully_connected', 'FullyConnected', 
-            '_sg_mkldnn_selfatt_qk', '_sg_mkldnn_selfatt_valatt']
+            '_sg_mkldnn_selfatt_qk', '_sg_mkldnn_selfatt_valatt',
+            'Flatten', 'Pooling']
     int8:  ['quantize_output', *fp32_ops]
 
   capabilities: &common_capabilities
@@ -78,7 +79,17 @@
             'activation': {
                 'dtype': ['int8', 'fp32'],
                 'algorithm': ['minmax', 'kl']}
-        },     
+        },
+        'Flatten': {
+            'activation': {
+                'dtype': ['int8', 'fp32'],
+                'algorithm': ['minmax', 'kl']}
+        },
+        'Pooling': {
+            'activation': {
+                'dtype': ['int8', 'fp32'],
+                'algorithm': ['minmax', 'kl']}
+        },
         'default': {
             'activation': {
                 'dtype': ['int8', 'fp32'],
