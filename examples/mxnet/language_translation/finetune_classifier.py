@@ -751,7 +751,23 @@ if __name__ == '__main__':
     elif args.tune:
         # lpot auto-tuning
         if only_inference:
-            calib_data = dev_data_list[0][1]
+
+            class DataLoaderFixed:
+                def __init__(self, dataloader, batch_size):
+                    self.dataloader = dataloader
+                    self.batch_size = batch_size
+                    self._iter = None
+
+                def __iter__(self):
+                    self._iter = iter(self.dataloader)
+                    return self
+
+                def __next__(self):
+                    input_ids, segment_ids, valid_length, label = self._iter.__next__()
+                    valid_length = valid_length.astype('float32')
+                    return (input_ids, segment_ids, valid_length, label)
+
+            calib_data = DataLoaderFixed(dev_data_list[0][1], dev_batch_size)
             from lpot.experimental import Quantization, common
             quantizer = Quantization("./bert.yaml")
             quantizer.model = common.Model(model)

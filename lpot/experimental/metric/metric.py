@@ -41,11 +41,16 @@ class PyTorchMetrics(object):
 @singleton
 class MXNetMetrics(object):
     def __init__(self):
+        from lpot.adaptor.mxnet_utils.util import check_mx_version
+        if check_mx_version('2.0.0'):
+            metric_module = mx.gluon.metric
+        else:
+            metric_module = mx.metric
         self.metrics = {
-            "Accuracy": WrapMXNetMetric(mx.metric.Accuracy),
-            "MAE": WrapMXNetMetric(mx.metric.MAE),
-            "MSE": WrapMXNetMetric(mx.metric.MSE),
-            "Loss": WrapMXNetMetric(mx.metric.Loss),
+            "Accuracy": WrapMXNetMetric(metric_module.Accuracy),
+            "MAE": WrapMXNetMetric(metric_module.MAE),
+            "MSE": WrapMXNetMetric(metric_module.MSE),
+            "Loss": WrapMXNetMetric(metric_module.Loss),
         }
         self.metrics.update(MXNET_METRICS)
 

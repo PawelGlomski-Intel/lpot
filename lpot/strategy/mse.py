@@ -159,6 +159,8 @@ class MSETuneStrategy(TuneStrategy):
                 ordered_ops = sorted(ops_mse.keys(), key=lambda key: ops_mse[key], reverse=True)
                 op_cfgs = copy.deepcopy(best_cfg)
                 for op in ordered_ops:
+                    if 'fp32' not in self.capability['opwise'][op]['activation']['dtype']:
+                        continue
                     old_cfg = copy.deepcopy(op_cfgs['op'][op])
                     op_cfgs['op'][op]['activation'].clear()
                     op_cfgs['op'][op]['activation']['dtype'] = 'fp32'
@@ -174,6 +176,8 @@ class MSETuneStrategy(TuneStrategy):
 
                 op_cfgs = copy.deepcopy(best_cfg)
                 for op in ordered_ops:
+                    if 'fp32' not in self.capability['opwise'][op]['activation']['dtype']:
+                        continue
                     op_cfgs['op'][op]['activation'].clear()
                     op_cfgs['op'][op]['activation']['dtype'] = 'fp32'
                     if 'weight' in op_cfgs['op'][op]:
